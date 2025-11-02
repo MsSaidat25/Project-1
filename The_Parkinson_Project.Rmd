@@ -1,0 +1,712 @@
+---
+---
+Title: "Parkinson’s Disease Prediction using Metabolomics"
+Author: Oladimeji Adefila
+University of Michigan–Flint · Group 1
+
+
+Output:
+  html_document:
+    theme: default
+    toc: true
+    toc_float: true
+
+Date: "2025-10-30"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+----------------------------------------------------------------------- ----------
+This section installs and loads all required packages for the project.
+Run the install commands only once on a new system; afterwards, you can comment them out.
+--------------------------------------------------------------------------------------
+
+
+```{r}
+# Install required packages (first time only)
+
+# install.packages(c("readxl","tidyverse","caret","pROC","randomForest","glmnet","gridExtra"))
+
+# Load core libraries
+
+library(readxl)
+library(tidyverse)
+library(caret)
+library(pROC)
+library(randomForest)
+library(glmnet)
+library(gridExtra)
+
+# Reproducibility
+
+set.seed(123)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+```
+
+
+
+Data Import and Overview
+---------------------------------------------------------------------------------
+In this step we load both the Sample Meta Data and Log Transformed Data sheets from the provided Excel file, then explore their structure.
+------------------------------------------ ---------------------------------------
+
+
+```{r}
+
+library(readxl)
+
+meta <- read_excel(
+  "C:/Users/warms/OneDrive/Desktop/MSDTI/Data_Mining/FORD-0101-21ML+ DATA TABLES_SERUM (METADATA UPDATE) - 5.XLSX",
+  sheet = "Sample Meta Data"
+)
+
+data_log <- read_excel(
+  "C:/Users/warms/OneDrive/Desktop/MSDTI/Data_Mining/FORD-0101-21ML+ DATA TABLES_SERUM (METADATA UPDATE) - 5.XLSX",
+  sheet = "Log Transformed Data"
+)
+
+# C:/Users/HOME/Downloads/My FORD-0101-21ML+ DATA TABLES_SERUM (METADATA UPDATE) - 5.XLSX.xlsx
+
+
+# Preview metadata and metabolite table
+
+head(meta)
+head(data_log[, 1:10])
+
+```
+
+
+
+
+----------------------------------------------------------------------------------
+Target Variable and Merge
+
+We identify the diagnostic column in the metadata, recode it as a binary target (PD vs Control), and merge it with the metabolite table.
+--------------------------------------------------------------------------------
+
+
+```{r}
+meta <- meta %>%
+mutate(DIAGNOSIS = ifelse(COHORT == "PPMI", "PD", "Control"))
+
+merged_data <- meta %>%
+select(PARENT_SAMPLE_NAME, DIAGNOSIS) %>%
+inner_join(data_log, by = "PARENT_SAMPLE_NAME")
+
+table(merged_data$DIAGNOSIS)
+dim(merged_data)
+
+```
+
+
+
+------------------------------------------------------------------------------
+Data Normalization and Cleaning
+
+We scale numeric features (Z-score) and ensure no missing or infinite values remain.
+
+-----------------------------------------------------------------------------
+
+
+```{r}
+X <- merged_data %>% select(-PARENT_SAMPLE_NAME, -DIAGNOSIS)
+X_scaled <- as.data.frame(scale(X))
+
+final_data <- cbind(DIAGNOSIS = merged_data$DIAGNOSIS, X_scaled)
+
+# Replace Inf/NaN with median per column
+
+X_num <- final_data %>% select(-DIAGNOSIS)
+X_num[!is.finite(as.matrix(X_num))] <- NA
+for (col in colnames(X_num)) {
+X_num[[col]][is.na(X_num[[col]])] <- median(X_num[[col]], na.rm = TRUE)
+}
+final_data <- cbind(DIAGNOSIS = final_data$DIAGNOSIS, X_num)
+
+sum(is.na(final_data))
+
+```
+
+
+
+------------------------------------------------------------------- -----------------------
+We use correlation filtering to remove highly correlated variables (cutoff = 0.9) and apply LASSO regression for dimensionality reduction.
+---------------------------------------------------------------------------------
+
+-------------------
+Correlation Filter
+-------------------
+
+```{r}
+# --- Correlation Filter ---
+
+library(caret)  # for findCorrelation
+library(dplyr)
+
+# --- Correlation Filter ---
+corr_matrix <- cor(final_data %>% select(-DIAGNOSIS), use = "pairwise.complete.obs")
+corr_matrix[is.na(corr_matrix)] <- 0
+
+# Find highly correlated features
+high_corr <- findCorrelation(corr_matrix, cutoff = 0.9)
+
+# Get feature names (excluding DIAGNOSIS)
+feature_names <- colnames(final_data %>% select(-DIAGNOSIS))
+
+# Get names of features to remove
+features_to_remove <- feature_names[high_corr]
+
+cat("✅ Features before filtering:", ncol(final_data) - 1, "\n")
+cat("✅ Features to remove:", length(features_to_remove), "\n")
+
+# Remove highly correlated features
+if (length(features_to_remove) > 0) {
+  filtered_data <- final_data %>% 
+    select(-all_of(features_to_remove))
+} else {
+  filtered_data <- final_data
+}
+
+cat("✅ Features after filtering:", ncol(filtered_data) - 1, "\n")
+
+# Safety check
+if (ncol(filtered_data) - 1 < 2) {
+  stop("ERROR: Too few features remaining after correlation filtering. 
+       Try increasing the cutoff value (e.g., 0.95 instead of 0.9)")
+}
+
+```
+
+
+
+------------------------
+LASSO Feature Selection
+-----------------------
+```{r}
+
+# --- LASSO Feature Selection with Robust Imputation ---
+X_matrix <- as.matrix(filtered_data %>% select(-DIAGNOSIS))
+y_numeric <- ifelse(filtered_data$DIAGNOSIS == "PD", 1, 0)
+
+cat("Original dimensions:", nrow(X_matrix), "samples,", ncol(X_matrix), "features\n")
+cat("Missing values before imputation:", sum(is.na(X_matrix)), "\n")
+cat("Percentage of missing values:", round(100 * sum(is.na(X_matrix)) / (nrow(X_matrix) * ncol(X_matrix)), 2), "%\n")
+
+# Impute missing values with column medians (more robust than mean)
+for(i in 1:ncol(X_matrix)) {
+  if(any(is.na(X_matrix[, i]))) {
+    # Use median for imputation (more robust to outliers)
+    median_val <- median(X_matrix[, i], na.rm = TRUE)
+    
+    # If all values are NA, use 0
+    if(is.na(median_val)) {
+      X_matrix[, i] <- 0
+    } else {
+      X_matrix[is.na(X_matrix[, i]), i] <- median_val
+    }
+  }
+}
+
+# Remove any columns that are all NA (if they exist)
+all_na_cols <- apply(X_matrix, 2, function(x) all(is.na(x)))
+if(any(all_na_cols)) {
+  cat("Removing", sum(all_na_cols), "columns with all NA values\n")
+  X_matrix <- X_matrix[, !all_na_cols]
+}
+
+cat("Missing values after imputation:", sum(is.na(X_matrix)), "\n")
+cat("Final dimensions:", nrow(X_matrix), "samples,", ncol(X_matrix), "features\n")
+
+# Safety check
+if (ncol(X_matrix) < 2) {
+  stop("ERROR: Too few features remaining. Check your data preprocessing.")
+}
+
+# Fit LASSO with cross-validation
+cv.lasso <- cv.glmnet(X_matrix, y_numeric, family = "binomial", alpha = 1)
+plot(cv.lasso)
+title("LASSO Cross-Validation Curve", line = 2.5)
+
+# Extract coefficients at lambda.min
+lasso_coef <- coef(cv.lasso, s = "lambda.min")
+lasso_coef_matrix <- as.matrix(lasso_coef)
+
+# Get selected features (excluding intercept)
+selected_features <- rownames(lasso_coef_matrix)[
+  lasso_coef_matrix[, 1] != 0 & rownames(lasso_coef_matrix) != "(Intercept)"
+]
+
+# Create dataset with selected features
+lasso_data <- filtered_data %>% 
+  select(DIAGNOSIS, all_of(selected_features))
+
+cat("✅ Number of LASSO-selected features:", length(selected_features), "\n")
+if(length(selected_features) > 0) {
+  cat("Selected features:", paste(selected_features, collapse = ", "), "\n")
+} else {
+  cat("⚠️ Warning: No features were selected by LASSO. Try adjusting lambda.\n")
+}
+
+
+```
+
+
+---------------------------------------------------------------------------
+We split the dataset (80/20) for both the full and LASSO-reduced features.
+----------------------------------------------------------------------------
+
+
+```{r}
+library(caret)
+library(dplyr)
+
+# Split train/test safely
+set.seed(123)  # For reproducibility
+train_index <- createDataPartition(filtered_data$DIAGNOSIS, p = 0.8, list = FALSE)
+
+train_full  <- filtered_data[train_index, ]
+test_full   <- filtered_data[-train_index, ]
+train_lasso <- lasso_data[train_index, ]
+test_lasso  <- lasso_data[-train_index, ]
+
+train_full$DIAGNOSIS  <- factor(train_full$DIAGNOSIS,  levels = c("Control", "PD"))
+test_full$DIAGNOSIS   <- factor(test_full$DIAGNOSIS,   levels = c("Control", "PD"))
+train_lasso$DIAGNOSIS <- factor(train_lasso$DIAGNOSIS, levels = c("Control", "PD"))
+test_lasso$DIAGNOSIS  <- factor(test_lasso$DIAGNOSIS,  levels = c("Control", "PD"))
+
+
+```
+
+    Model Building
+----------------------------------------------------------------------------------------
+We build two models: Logistic Regression and Random Forest, using both full and LASSO datasets.
+-------------------------------------------------------------------------------------
+
+Logistic Regression
+
+```{r}
+
+# --- Fixed Safe Column Removal Function ---
+remove_bad_cols <- function(df) {
+  bad_cols <- c()
+  for(col in names(df)) {
+    if(col == "DIAGNOSIS") next
+    
+    # Check if all NA
+    if(all(is.na(df[[col]]))) {
+      bad_cols <- c(bad_cols, col)
+      cat("Removing", col, "- all NA\n")
+    } 
+    # Check for zero variance (only if not all NA and is numeric)
+    else if(is.numeric(df[[col]])) {
+      col_var <- var(df[[col]], na.rm = TRUE)
+      if(!is.na(col_var) && col_var == 0) {
+        bad_cols <- c(bad_cols, col)
+        cat("Removing", col, "- zero variance\n")
+      }
+    }
+  }
+  
+  if(length(bad_cols) > 0) {
+    cat("Total columns to remove:", length(bad_cols), "\n")
+    df <- df %>% select(-all_of(bad_cols))
+  }
+  return(df)
+}
+
+# Clean the data
+cat("Cleaning train_full...\n")
+train_full <- remove_bad_cols(train_full)
+test_full <- test_full %>% select(all_of(names(train_full)))
+
+cat("Cleaning train_lasso...\n")
+train_lasso <- remove_bad_cols(train_lasso)
+test_lasso <- test_lasso %>% select(all_of(names(train_lasso)))
+
+cat("\nFinal dimensions:\n")
+cat("train_full:", dim(train_full), "\n")
+cat("test_full:", dim(test_full), "\n")
+cat("train_lasso:", dim(train_lasso), "\n")
+cat("test_lasso:", dim(test_lasso), "\n")
+
+```
+
+
+# --- Logistic Regression ---
+```{r}
+
+cat("\n=== Training Logistic Regression ===\n")
+
+model_lr_full <- glm(DIAGNOSIS ~ ., 
+                     data = train_full, 
+                     family = binomial,
+                     control = list(maxit = 100))
+
+cat("✅ Full model trained\n")
+
+# LASSO model
+model_lr_lasso <- glm(DIAGNOSIS ~ ., 
+                      data = train_lasso, 
+                      family = binomial,
+                      control = list(maxit = 100))
+
+cat("✅ LASSO model trained\n")
+
+# Make predictions
+pred_lr_full <- predict(model_lr_full, test_full, type = "response")
+pred_lr_lasso <- predict(model_lr_lasso, test_lasso, type = "response")
+
+# Convert to class labels
+pred_class_lr_full <- factor(ifelse(pred_lr_full > 0.5, "PD", "Control"), 
+                              levels = c("Control", "PD"))
+pred_class_lr_lasso <- factor(ifelse(pred_lr_lasso > 0.5, "PD", "Control"),
+                               levels = c("Control", "PD"))
+
+cat("✅ Predictions complete\n")
+
+
+```
+
+
+---------------------------------
+Random Forest
+---------------------------
+
+
+```{r}
+library(randomForest)
+
+# Fix column names first
+colnames(train_full)  <- make.names(colnames(train_full), unique = TRUE)
+colnames(test_full)   <- make.names(colnames(test_full), unique = TRUE)
+colnames(train_lasso) <- make.names(colnames(train_lasso), unique = TRUE)
+colnames(test_lasso)  <- make.names(colnames(test_lasso), unique = TRUE)
+```
+
+
+```{r}
+# Define predictor sets safely
+predictors_full  <- setdiff(names(train_full),  "DIAGNOSIS")
+predictors_lasso <- setdiff(names(train_lasso), "DIAGNOSIS")
+```
+
+
+```{r}
+# Ensure predictors exist in test dataset
+predictors_lasso <- intersect(predictors_lasso, names(test_lasso))
+predictors_full  <- intersect(predictors_full,  names(test_full))
+```
+
+
+```{r}
+# --- Random Forest (Full Feature Set)
+if (length(predictors_full) > 0) {
+  model_rf_full <- randomForest(
+    x = train_full[, predictors_full],
+    y = train_full$DIAGNOSIS,
+    importance = TRUE
+  )
+  pred_rf_full <- predict(model_rf_full, test_full[, predictors_full])
+}
+```
+
+
+```{r}
+# --- Random Forest (LASSO Feature Set)
+if (length(predictors_lasso) > 0) {
+  model_rf_lasso <- randomForest(
+    x = train_lasso[, predictors_lasso],
+    y = train_lasso$DIAGNOSIS,
+    importance = TRUE
+  )
+  pred_rf_lasso <- predict(model_rf_lasso, test_lasso[, predictors_lasso])
+}
+
+```
+
+
+
+
+     Model Evaluation
+-------------------------------------------------------------------------------
+We compute ROC curves, AUC values, and display confusion matrices for each model.
+--------------------------------------------------------------------------------
+
+
+
+```{r}
+roc_lr_full   <- roc(as.numeric(test_full$DIAGNOSIS == "PD"),  pred_lr_full)
+roc_lr_lasso  <- roc(as.numeric(test_lasso$DIAGNOSIS == "PD"), pred_lr_lasso)
+roc_rf_full   <- roc(as.numeric(test_full$DIAGNOSIS == "PD"),  as.numeric(pred_rf_full == "PD"))
+roc_rf_lasso  <- roc(as.numeric(test_lasso$DIAGNOSIS == "PD"), as.numeric(pred_rf_lasso == "PD"))
+
+auc_results <- data.frame(
+Model = c("LR Full","LR LASSO","RF Full","RF LASSO"),
+AUC   = c(auc(roc_lr_full), auc(roc_lr_lasso), auc(roc_rf_full), auc(roc_rf_lasso))
+)
+
+auc_results
+
+```
+
+
+
+Visualization Dashboard
+------------------------------------------------------------------------------------------
+This section visualizes model performance and feature importance in a single 2×2 dashboard.
+-------------------------------------------------------------------------------------------
+
+```{r}
+# ROC Curves
+
+p1 <- ggroc(list("LR Full" = roc_lr_full, "LR LASSO" = roc_lr_lasso,
+"RF Full" = roc_rf_full, "RF LASSO" = roc_rf_lasso)) +
+geom_line(size = 1.2) +
+scale_color_manual(values = c("blue","green","red","purple")) +
+labs(title = "ROC Curves Comparison", x = "1 - Specificity", y = "Sensitivity") +
+theme_minimal()
+```
+
+
+```{r}
+# AUC Comparison
+
+p2 <- ggplot(auc_results, aes(Model, AUC, fill = Model)) +
+geom_col(width = 0.6) +
+geom_text(aes(label = round(AUC, 3)), vjust = -0.5, size = 4) +
+ylim(0, 1) +
+labs(title = "Model AUC Comparison", y = "AUC", x = "Model Type") +
+scale_fill_manual(values = c("blue","green","red","purple")) +
+theme_minimal()
+```
+
+
+```{r}
+# Feature Importance
+
+importance_df <- as.data.frame(importance(model_rf_lasso))
+importance_df$Metabolite <- rownames(importance_df)
+importance_top20 <- importance_df %>%
+arrange(desc(MeanDecreaseGini)) %>% head(20)
+
+p3 <- ggplot(importance_top20, aes(x = reorder(Metabolite, MeanDecreaseGini),
+y = MeanDecreaseGini, fill = MeanDecreaseGini)) +
+geom_col() + coord_flip() +
+labs(title = "Top 20 Metabolites Driving PD Classification",
+x = "Metabolite (m/z Feature)", y = "Importance (Gini)") +
+theme_minimal()
+```
+
+
+--------------------------
+ROC Curves Comparison
+------------------------------
+
+```{r}
+# ROC Curves Comparison
+p1 <- ggroc(list(
+  "LR Full"   = roc_lr_full,
+  "LR LASSO"  = roc_lr_lasso,
+  "RF Full"   = roc_rf_full,
+  "RF LASSO"  = roc_rf_lasso
+)) +
+  geom_line(size = 1.2) +
+  scale_color_manual(values = c("blue", "green", "red", "purple")) +
+  labs(
+    title = "ROC Curves Comparison",
+    x = "1 - Specificity",
+    y = "Sensitivity"
+  ) +
+  theme_minimal()
+```
+
+
+```{r}
+# Show only the ROC plot
+p1
+
+```
+
+
+
+
+-----------------------------
+Model AUC Comparison
+-----------------------------
+
+```{r}
+p2 <- ggplot(auc_results, aes(x = Model, y = AUC, fill = Model)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = round(AUC, 3)), vjust = -0.5, size = 4) +
+  ylim(0, 1) +
+  labs(
+    title = "Model AUC Comparison",
+    y = "Area Under Curve (AUC)",
+    x = "Model Type"
+  ) +
+  theme_minimal() +
+  scale_fill_manual(values = c("blue", "green", "red", "purple"))
+```
+
+
+```{r}
+# Show only the AUC bar chart
+p2
+
+```
+
+
+---------------------------------------------
+Top 20 Metabolites (Feature Importance)
+-----------------------------------------------
+```{r}
+importance_df <- as.data.frame(importance(model_rf_lasso))
+importance_df$Metabolite <- rownames(importance_df)
+
+importance_top20 <- importance_df %>%
+  arrange(desc(MeanDecreaseGini)) %>%
+  head(20)
+
+p3 <- ggplot(importance_top20, aes(
+  x = reorder(Metabolite, MeanDecreaseGini),
+  y = MeanDecreaseGini,
+  fill = MeanDecreaseGini
+)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Top 20 Metabolites Driving PD Classification",
+    x = "Metabolite (m/z Feature)",
+    y = "Mean Decrease Gini (Importance)"
+  ) +
+  theme_minimal()
+```
+
+
+```{r}
+# Show only the feature importance chart
+p3
+
+```
+
+----------------------------------
+Confusion Matrix Heatmap
+--------------------------------
+```{r}
+cm_rf_lasso <- confusionMatrix(pred_rf_lasso, test_lasso$DIAGNOSIS)
+cm_df <- as.data.frame(cm_rf_lasso$table)
+
+p4 <- ggplot(cm_df, aes(Reference, Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), color = "white", size = 5, fontface = "bold") +
+  scale_fill_gradient(low = "#c0392b", high = "#27ae60") +
+  labs(
+    title = "Confusion Matrix – Random Forest (LASSO)",
+    x = "Actual Class",
+    y = "Predicted Class"
+  ) +
+  theme_minimal()
+```
+
+
+```{r}
+# Show only the confusion matrix plot
+p4
+
+```
+
+
+```{r}
+grid.arrange(p1, p2, p3, p4, ncol = 2)
+
+```
+
+
+
+```{r}
+# Confusion Matrix
+
+cm_rf_lasso <- confusionMatrix(pred_rf_lasso, test_lasso$DIAGNOSIS)
+cm_df <- as.data.frame(cm_rf_lasso$table)
+
+p4 <- ggplot(cm_df, aes(Reference, Prediction, fill = Freq)) +
+geom_tile(color = "white") +
+geom_text(aes(label = Freq), color = "white", size = 5, fontface = "bold") +
+scale_fill_gradient(low = "#c0392b", high = "#27ae60") +
+labs(title = "Confusion Matrix – Random Forest (LASSO)",
+x = "Actual Class", y = "Predicted Class") +
+theme_minimal()
+
+grid.arrange(p1, p2, p3, p4, ncol = 2)
+
+```
+
+----------------------------------------
+We Save Visual Outputs
+--------------------------------------
+
+```{r}
+if(!dir.exists("PD_Visuals")) dir.create("PD_Visuals")
+
+save_plot <- function(plot, filename, width=7, height=5, dpi=400) {
+ggsave(filename = paste0("PD_Visuals/", filename, ".png"),
+plot = plot, width = width, height = height, dpi = dpi)
+}
+
+save_plot(p1, "ROC_Curves_Comparison")
+save_plot(p2, "Model_AUC_Comparison")
+save_plot(p3, "Top20_Metabolites_Importance")
+save_plot(p4, "Confusion_Matrix_RF_LASSO")
+
+png("PD_Visuals/Full_Dashboard.png", width=1500, height=1000, res=200)
+grid.arrange(p1, p2, p3, p4, ncol=2)
+dev.off()
+cat("✅ All plots saved to the folder: PD_Visuals\n")
+
+```
+
+
+
+
+
+# Discussion
+
+From the evaluation results:
+
+ 1, Both Logistic Regression and Random Forest performed well, but Random Forest with   
+    LASSO-selected   features achieved the highest AUC. 
+    
+ 2, The selected metabolites show strong discriminatory power between PD and control groups.
+ 
+
+ 3, These findings suggest that metabolomics-based models can support early, non-invasive PD     
+    detection.  
+    
+    
+ 4,  Future work can include larger cohorts and validation on independent datasets.
+
+```
+
+
+
+               END                END                END
+
+
+
+
+
+
+
+
+
+
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
